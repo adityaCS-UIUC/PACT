@@ -1,0 +1,333 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix,epsfig,endnotes}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage[utf8]{inputenc}
+\usepackage{natbib}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{mathtools}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage[ruled,commentsnumbered]{algorithm2e}
+\usepackage[noend]{algpseudocode}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{color}
+\usepackage{import}
+\usepackage{hyperref}
+\usepackage{graphics, enumitem}
+\hypersetup{
+  colorlinks=true,      % false: boxed links; true: colored links
+  linkcolor=blue,       % color of internal links
+  citecolor=magenta,    % color of links to bibliography
+  filecolor=cyan,       % color of file links
+  urlcolor=red          % color of external links
+}
+
+\setlength\intextsep{0pt}
+
+\newenvironment{denseitemize}{
+\begin{itemize}[topsep=2.5pt, partopsep=0pt, leftmargin=1.5em]
+  \setlength{\itemsep}{2.5pt}
+  \setlength{\parskip}{0pt}
+  \setlength{\parsep}{0pt}
+}{\end{itemize}}
+
+\newenvironment{denseenum}{
+\begin{enumerate}[topsep=2.5pt, partopsep=0pt, leftmargin=1.5em]
+  \setlength{\itemsep}{2.5pt}
+  \setlength{\parskip}{0pt}
+  \setlength{\parsep}{0pt}
+}{\end{enumerate}}
+
+
+\title{PACT: Pruned Agent Call Throughput}
+
+\author{
+Smit Vasani\\
+\texttt{svasani2@illinois.edu}
+\and
+Aditya Prasath Ravilla Shridhar Prasad\\
+\texttt{apr11@illinois.edu}
+\and
+Chandra Sreeja Chinigepalli\\
+\texttt{cc215@illinois.edu}
+\and
+Ram Prakash Reddy Motati\\
+\texttt{rmotati2@illinois.edu}
+\and
+Vanshika Chokhani\\
+\texttt{vc50@illinois.edu}
+}
+
+\import{./}{macros.tex}
+
+\begin{document}
+
+\maketitle
+
+\section{Abstract}
+Modern reasoning agents in production tool-use settings sacrifice latency for self-correction: they iteratively plan, reflect, and re-plan before issuing a single tool call, even when a viable call became inferable several sentences ago \cite{overthinking2025,masterman2025ai}. We present \textbf{PACT (Pruned Agent Call Throughput)}, a speculative early-exit pipeline for ToolBench-style tool use \cite{qin2023toolbench} built on reasoning--acting agents \cite{yao2022react}: a large \textbf{Reasoner} (Qwen QwQ-32B, Qwen family \cite{qwen3}) produces sentence-level reasoning; after each prefix, a lightweight fine-tuned \textbf{Speculator} (Phi-3-mini with LoRA) outputs READY vs.\ NOT\_READY; when $P(\text{READY})\ge \tau$, a fine-tuned \textbf{Instructor} (Phi-3-mini with LoRA) maps the partial thought to a structured \texttt{\#TOOL[name]\{args\}} call, instead of waiting for the full trace---an instance of learnable early exit related to speculative execution \cite{leviathan2023fast,pan2025specreason}. We build supervision from ToolBench-sourced tasks by splitting QwQ-32B traces into cumulative sentence prefixes and labeling each prefix with \textbf{GPT-4.1 mini} as to whether sufficient context exists for the reference tool invocation. We train the Speculator and Instructor with supervised fine-tuning (including first-token classification for readiness) and evaluate end-to-end on a fixed 500-task ToolBench eval set, grading runs against baseline full-reasoning traces. PACT contributes the full data pipeline (traces, prefixes, judge labels, train/test split), the Reasoner--Speculator--Instructor stack with threshold-gated handoff, and reproducible evaluation and grading scripts.
+
+\section{Introduction}
+
+Production tool-use agents built on the ReAct pattern \cite{yao2022react} interleave free-form reasoning with blocking tool calls: each step adds wall-clock time for both deliberation and execution. Reliability therefore trades off sharply with latency---agents that plan, reflect, and hedge against edge cases can spend orders of magnitude more tokens \emph{after} the next tool call is already inferable than they spend on the call itself \cite{overthinking2025}. Prior mitigations---prompting for brevity, per-token confidence heuristics, or fixed reasoning budgets \cite{qwen3,han2024tokenbudget}---either sacrifice consistency or conflate ``fluent next-token prediction'' with ``task-ready tool invocation.''
+
+\textbf{PACT} is a three-stage pipeline for ToolBench-style tool use \cite{qin2023toolbench}. A \textbf{Reasoner} (Qwen QwQ-32B) generates reasoning incrementally. A \textbf{Speculator} (Phi-3-mini + LoRA) scores each cumulative prefix as READY or NOT\_READY; at threshold $\tau$, we stop extending the thought and invoke an \textbf{Instructor} (Phi-3-mini + LoRA) that emits the concrete tool call. Training data come from ToolBench tasks: we materialize QwQ-32B traces on our task set, expand them into monotone sentence prefixes, and use \textbf{GPT-4.1 mini} to judge whether each prefix suffices for the reference action. We split judged rows into train and test JSONL, fine-tune both adapters on Modal, and run end-to-end evaluation on 500 held-out ToolBench queries with automated grading against a baseline that uses full reasoning.
+
+\textbf{Contributions.} (i)~An end-to-end labeling pipeline: cumulative prefixes, GPT-4.1 mini judging, and train/test splits for speculator and instructor SFT. (ii)~A released dual-adapter design (Speculator + Instructor) with $\tau$-gated early exit on top of QwQ-32B reasoning. (iii)~A fixed 500-task evaluation protocol with automated grading and metrics scripts. Section~\ref{sec:related} surveys related work; Sections~\ref{sec:proposed}--\ref{sec:evalplan} detail data, training, and evaluation metrics.
+
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Problem: over-deliberation before the first tool call}
+
+Modern autonomous agents in high-stakes domains increasingly rely on iterative planning and self-correction to ensure accuracy \cite{nair2025flow,yu2024exact}. However, this reliability introduces a critical \emph{over-deliberation} bottleneck: internal reflection latency often dwarfs actual execution time \cite{masterman2025ai}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\columnwidth]{ps.png}
+  \caption{Over-deliberation vs.\ optimized execution: deferring the exit decision to a Speculator can cut pre-call reasoning without changing the eventual tool surface.}
+  \label{fig:overdeliberation}
+\end{figure}
+
+Current mitigations---prompt engineering for conciseness or per-token confidence thresholds \cite{schuster2022calm}---are insufficient: they are either too brittle to preserve logical consistency or fail to distinguish linguistic predictability from task-level readiness. Rigid reasoning token budgets (e.g., in recent Qwen models \cite{qwen3}) lack per-instance nuance, often ending difficult queries too early while still wasting compute on easy ones. PACT targets these failures by decoupling the exit decision from the primary model and using a fine-tuned Speculator to truncate reasoning only once a viable next call is inferable.
+
+\subsection{Why latency matters for deployment}
+
+LLM-driven agents are constrained by a crippling latency bottleneck that threatens production viability. Designed for deep reasoning, they frequently enter prolonged self-reflective loops over rare edge cases \cite{masterman2025ai}. Because tool APIs are invoked sequentially and block until completion, latency compounds across the horizon; state-of-the-art pipelines can require tens of minutes to hours per run---e.g., up to 45 minutes for deep research workloads \cite{mialon2023gaia}.
+
+Treating perfect correctness as the sole objective ignores enterprise latency budgets. In customer support and other interactive settings, responsiveness is often more valuable than marginal correctness. Over-deliberation yields abandoned chat sessions, backed-up support queues, and steep inference bills; deeper self-correction layers show diminishing accuracy returns at increasing cost \cite{overthinking2025}. Our implemented system targets that trade-off by firing the Instructor early when the Speculator is confident, and we quantify latency and tool-call quality on a 500-task ToolBench evaluation set \cite{qin2023toolbench} (Section~\ref{sec:evalplan}).
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Speculative Decoding and Execution}
+Speculative decoding \cite{leviathan2023fast} accelerates LLM inference by using a 
+smaller draft model to predict tokens verified in parallel by a larger model, achieving 
+throughput gains without quality loss. LayerSkip \cite{elhoushi2024layerskip} extends 
+this paradigm by training decoder-only models with a layer-dropout schedule, enabling 
+early exit at intermediate layers and combining it with self-speculative decoding without 
+requiring an auxiliary model. TIDE \cite{tide2025} takes a complementary approach, 
+training lightweight binary MLP classifiers on frozen model hidden states using cosine 
+similarity as a convergence signal, achieving early exit with under 525K additional 
+parameters and no base model retraining. SpecReason \cite{pan2025specreason} extends 
+speculative decoding to reasoning, exploiting the semantic flexibility of thinking tokens: 
+a lightweight model handles simpler intermediate steps while the base model verifies 
+outputs, achieving 1.4--3.0$\times$ speedup with 0.4--9.0\% accuracy improvements. 
+Speculative Actions \cite{ye2026speculative} applies the same principle at the agentic 
+action level, parallelizing tool invocations across steps to achieve up to 55\% 
+next-action prediction accuracy. While these works accelerate the outer execution loop 
+or target layer-level exit in single-turn generation, PACT targets the inner deliberation 
+loop of multi-step agentic systems, pruning reasoning chains before any tool call is 
+issued, and delegates the exit decision to a dedicated fine-tuned Speculator rather than 
+relying on the primary model's own hidden states.
+
+\subsection{Agentic Systems and Over-Deliberation}
+Autonomous agents iteratively plan, reflect, and self-correct 
+\cite{nair2025flow, yu2024exact}, but this reliability introduces severe 
+over-deliberation \cite{masterman2025ai}. Because agents execute blocking API calls 
+sequentially, latency accumulates linearly, with state-of-the-art pipelines requiring 
+up to 45 minutes per run \cite{mialon2023gaia}. Chain-of-Thought prompting 
+\cite{wei2022chain}, while foundational to enabling such reasoning, is itself a root 
+cause of this bottleneck: decomposing problems into intermediate steps incurs 
+significant token overhead that compounds across multi-step agentic horizons. Recent 
+empirical work \cite{overthinking2025} quantifies this precisely, demonstrating that 
+task accuracy follows an inverted U-shaped curve with reasoning chain length, and that 
+easy problems begin to over-deliberate as early as 2K tokens while hard problems require 
+up to 8K, confirming that uniform compute allocation is fundamentally wasteful. 
+Flow-of-Options \cite{nair2025flow} and EXACT \cite{yu2024exact} enrich reasoning for 
+correctness by diversifying trajectories and enabling reflective self-correction; PACT 
+takes the complementary stance, learning to recognize when sufficient reasoning has 
+already occurred and exiting early. ToolBench \cite{qin2023toolbench} informs our data 
+collection by providing diverse real-world tool-use trajectories from which we label 
+viable early exit points. The ReAct framework \cite{yao2022react}, which interleaves 
+reasoning traces with tool actions in an iterative Thought $\rightarrow$ Action 
+$\rightarrow$ Observation loop, defines the agent execution paradigm that PACT directly 
+targets for latency optimization.
+
+\subsection{Reasoning Budgets, Adaptive Exit Policies, and Hybrid Architectures}
+The hybrid SAS-MAS paradigm of \cite{gao2025single} addresses reasoning cost at the 
+\textit{request level}: an LLM-based rater routes each query to either a fast 
+single-agent system or a robust multi-agent system, achieving 1.1--12\% accuracy 
+improvements with up to 88.1\% cost reduction. However, this constitutes 
+\textit{macro-efficiency}: once a request is routed to a deep-reasoning agent, that 
+agent remains bound by sequential, blocking deliberation. PACT instead performs 
+\textit{intra-execution optimization}, with the Speculator monitoring the live reasoning 
+trace and triggering early exit at confidence threshold $\tau$.
+
+Recent frontier models such as Qwen3 \cite{qwen3} introduce hard reasoning token budgets 
+to curb over-deliberation, while Token-Budget-Aware LLM Reasoning \cite{han2024tokenbudget} 
+proposes dynamically estimating a per-instance token budget before generation begins. 
+Both approaches are fundamentally \textit{input-bound}: they set a ceiling on deliberation 
+prior to execution, without monitoring whether the reasoning trace has actually converged. 
+This produces two symmetric failure modes: a simple query that converges early but holds 
+a large budget wastes the intervening computation, while a complex query still 
+mid-deliberation at budget exhaustion is forced to emit a tool call from an incomplete 
+reasoning state. Dynamic Early Exit \cite{dynamicexit2025} partially addresses this by 
+monitoring model behavior at reasoning transition points such as ``Wait'' tokens and 
+terminating generation when confidence is high, achieving 31--43\% CoT length reduction 
+without any fine-tuning. Ada-RS \cite{nair2026adars} improves on static budgets by 
+framing the stopping decision as a learned adaptive policy. PACT goes further than all 
+of these, removing the budget abstraction entirely and replacing it with a 
+\textit{convergence-bound} exit policy: the Speculator stops because it 
+\textit{knows enough}, not because it \textit{ran out of space} or hit a 
+pre-estimated ceiling, with a single threshold $\tau$ governing behavior across 
+heterogeneous tasks without per-task ceiling calibration.
+
+\subsection{Reasoning Chain Pruning and Overthinking Mitigation}
+A growing body of work targets redundant deliberation in reasoning chains. TERMINATOR 
+\cite{terminator2026} learns optimal exit points by supervising on the first arrival of 
+a model's correct final answer, achieving 14--55\% CoT length reduction across MATH-500, 
+AIME 2025, HumanEval, and GPQA. ``Don't Overthink It'' \cite{dontoverthink2025} 
+demonstrates that shorter reasoning paths are more effective because they involve fewer 
+backtracks, and that a short-$m$@$k$ selection strategy can reduce compute by up to 40\% 
+while matching majority-voting performance. Sui et al.\ \cite{sui2025overthinking} 
+provide a taxonomy of overthinking in large reasoning models, categorizing mitigation 
+strategies into post-training, prompt-based, and output-based approaches, establishing 
+the conceptual vocabulary that motivates PACT's design. Confident Adaptive Language 
+Modeling (CALM) \cite{schuster2022calm} introduced the foundational idea of 
+confidence-threshold early exit, achieving 2--3$\times$ speedup on translation tasks, 
+which PACT extends to the agentic tool-call setting. PACT differentiates from all of 
+the above by decoupling the pruning decision entirely from the primary model, delegating 
+it to a fine-tuned Speculator that monitors the primary model's reasoning stream 
+independently. This architectural separation allows PACT to apply pruning without 
+modifying the primary reasoner. Preference optimization methods such as DPO 
+\cite{rafailov2024direct} offer one path to reshape the Speculator's confidence 
+curve from (chosen: early, successful) vs.\ (rejected: over-deliberated) pairs; 
+our submitted system uses supervised SFT only.
+
+\section{Proposed Solution}
+\label{sec:proposed}
+
+\subsection{Data Collection and Labeling}
+
+\subsubsection{Dataset Source and Role}
+We ground our work in ToolBench \cite{qin2023toolbench}, a large-scale corpus for tool use and function calling hosted as \texttt{tuandunghcmut/toolbench v1}. The corpus is structured as instruction-style supervision through multi-turn dialogs where a model must compose \texttt{Thought} $\rightarrow$ \texttt{Action} $\rightarrow$ \texttt{Action Input} sequences and consume function observations. This design targets generalization across diverse real world APIs rather than simple "gadget" demonstrations, matching our need for realistic task text, structured calls, and noisy success/failure modes encountered in production.
+
+We utilize ToolBench in two complementary ways:
+\begin{denseitemize}
+    \item \textbf{Benchmark Splits:} Instruction configurations (G1/G2/G3) provide tasks alongside comprehensive API specifications, including names, descriptions, and parameter schemas, allowing the agent to execute against a task-specific tool surface.
+    \item \textbf{Training Conversations:} The default configuration provides multi turn dialogs that serve as a source for ground truth solution paths. From these, we extract ordered steps with natural language reasoning paired with faithful tool-argument pairs, capturing "what was said" versus "what was called" without manual scenario drafting.
+\end{denseitemize}
+
+\subsubsection{Data Processing Pipeline}
+Our parser maps raw ToolBench rows into an internal task object containing the prompt, available tool specs, and a \texttt{ground\_truth\_path}. Because raw dialogs are not direct classification labels, we derive a supervised set for the Speculator a model designed to estimate from partial reasoning whether it is appropriate to commit to a specific call via the following pipeline:
+
+\paragraph{Trajectory Sources}
+Trajectories are sourced through a three-pronged approach. First, tasks with existing ground-truth paths in ToolBench are labeled directly using published thoughts and actions. Second, for benchmark tasks lacking paths, we deploy a ReAct style agent \cite{yao2022react} to explore the task. Third, we grade these exploratory runs using a hybrid of reference path comparison and LLM-based judgment, retaining only successful trajectories to ensure the Speculator learns from optimal behavior.
+
+\paragraph{Cumulative Reasoning Prefixes}
+To simulate the real time stream of an LLM's thought process, we take the thought text for each step, perform sentence splitting, and construct monotone prefixes. For instance, a thought containing three sentences is decomposed into three separate training instances: the first sentence, the first two combined, and the full thought. Each prefix represents a distinct "reasoning-so-far" state along a trajectory toward the recorded action.
+
+\paragraph{Oracle-Based Labels}
+For every cumulative prefix, we must determine if the reasoning contains sufficient grounding to justify the target tool name and specific argument values. We use \textbf{GPT-4.1 mini} as a labeling oracle to avoid the brittleness of deterministic string-matching, which often fails when tool names are non-lexical or arguments are paraphrased. The judge receives a fixed prompt and must return a binary READY/NOT\_READY (or equivalent) verdict; READY indicates the prefix is ``commit-ready,'' while NOT\_READY signals that the model must continue accumulating reasoning.
+
+\paragraph{Convergence-Point Identification}
+We scan the labeled prefixes chronologically and apply a stopping rule, where we only assign a positive label to the \textit{earliest} accepted prefix in a sequence. This ensures the Speculator is trained to recognize the first defensible point of convergence, specifically targeting the reduction of over-deliberation latency. The final dataset is exported in JSONL format, mapping each task prompt and thought prefix to its binary convergence label.
+
+\subsection{Fine-Tuning Strategy}
+
+The PACT framework employs a staged fine-tuning pipeline to transform a compact language model into an efficient Speculator. We initialized our baseline Speculator using the frozen weights of the Phi-3-mini architecture, augmenting it with a task-specific linear classification head. This "head-only" tuning approach ensures the model retains its pre-trained linguistic reasoning while learning to map internal states to a binary "readiness" signal. The model was trained via Supervised Fine-Tuning (SFT) on a curated dataset of 3,000 agent trajectories derived from ToolBench \cite{qin2023toolbench}, with 2,850 examples allocated for training over two epochs.
+
+Our initial evaluation on a validation set of 150 samples reveals a significant calibration gap. As shown in Figure~\ref{fig:accuracy_threshold}, while the model achieves a peak accuracy of 81.3\%, this performance is only reachable at a low confidence threshold ($\tau \approx 0.26$). At the standard classification threshold of $\tau = 0.5$, the Speculator behaves cautiously, achieving high precision (0.887) but poor recall (0.724). Conversely, optimizing for recall (0.897) at the lower threshold introduces 19 false-positive "READY" signals, which in a production environment would lead to premature and likely malformed tool invocations. These results, summarized in Table~\ref{tab:sft_results}, indicate that the SFT baseline internalizes the "Aha!" moment but lacks the probabilistic confidence to trigger it efficiently.
+
+To move beyond this cautious baseline, our next phase involves doing full-scale SFT and scaling it to a larger trajectory corpus to improve the model's foundational grasp of diverse tool schemas. Following this, we will implement Direct Preference Optimization (DPO) to explicitly refine the model's confidence distribution \cite{rafailov2024direct}. By providing the Speculator with preference pairs that favor pruned, successful trajectories over redundant, over-deliberated ones, we intend to "stretch" the confidence curve. This alignment will penalize the observed under-confidence and push the model toward a policy that is both "confidently fast" and precise, effectively resolving the current accuracy-latency trade-off \cite{nair2026adars}. \\
+
+\begin{table}[htbp]
+\centering
+\caption{SFT Baseline Performance: Cautious vs. Aggressive}
+\label{tab:sft_results}
+\resizebox{\columnwidth}{!}{% This forces the table to fit the column width
+\begin{tabular}{lcccc}
+\hline
+\textbf{Threshold ($\tau$)} & \textbf{Acc.} & \textbf{Prec.} & \textbf{Rec.} & \textbf{F1} \\ \hline
+0.50 (Default) & 0.787 & 0.887 & 0.724 & 0.798 \\
+0.26 (Best Acc) & 0.813 & 0.804 & 0.897 & 0.848 \\ \hline
+\end{tabular}
+}
+\end{table}
+
+\vspace{0.2cm}
+
+\begin{figure}[htbp]\centering\includegraphics[width=0.45\textwidth]{accuracy_vs_threshold_val.png}\caption{Accuracy vs. Confidence Threshold for the Phi-3-mini Speculator baseline.}\label{fig:accuracy_threshold}\end{figure}
+
+\section{Evaluation Plan}
+\label{sec:evalplan}
+
+We evaluate PACT along three dimensions: latency reduction, accuracy under 
+early exit decisions, and pruning effectiveness. All experiments are conducted 
+on ToolBench \cite{qin2023toolbench} trajectories spanning tool use tasks of 
+varying complexity. Our goal is to quantify how effectively the fine tuned 
+Speculator learns to predict valid early exit points, and to measure the 
+latency gains from early exit at threshold $\tau$ (e.g., on our 500-task eval set).
+
+\paragraph{1. Latency Reduction.}
+Let $T_{\text{seq}}$ denote execution time of the baseline agent and 
+$T_{\text{PACT}}(\tau)$ denote execution time when early exit is triggered at 
+confidence threshold $\tau$. We define relative latency improvement as:
+\[
+\Delta_T(\tau) = \frac{T_{\text{seq}} - T_{\text{PACT}}(\tau)}{T_{\text{seq}}}.
+\]
+We measure end-to-end completion time, time to first tool invocation, 
+and time to first user-visible output in graded runs. These metrics capture how early exit decisions 
+reduce cumulative reasoning latency across multi step workflows.
+
+\paragraph{2. Accuracy, Precision, and Recall under Early Exit.}
+Let $A_{\text{seq}}$ denote baseline task accuracy and $A_{\text{PACT}}(\tau)$ 
+denote accuracy under early exit. We define accuracy degradation as:
+\[
+\Delta_A(\tau) = A_{\text{seq}} - A_{\text{PACT}}(\tau).
+\]
+Beyond aggregate accuracy, we track precision and recall of the Speculator's 
+exit predictions separately, as they capture two distinct failure modes. High 
+precision but low recall (as observed in our baseline at $\tau = 0.5$, 
+where precision $= 0.887$ and recall $= 0.724$) reflects an overly cautious 
+Speculator that under predicts readiness, missing valid exit points. 
+Conversely, high recall but low precision (as seen at $\tau = 0.26$, where 
+recall $= 0.897$ but 19 false positive \texttt{READY} signals were observed) 
+reflects an over eager Speculator that incorrectly predicts readiness on 
+incomplete reasoning states, risking malformed tool invocations. We sweep 
+$\tau$ in end-to-end evaluation to characterize the precision--recall trade-off for exit decisions.
+
+\paragraph{3. Pruning Effectiveness.}
+To directly measure how aggressively the Speculator prunes unnecessary 
+deliberation, we track the exit position within the reasoning trajectory. 
+Let $L_{\text{full}}$ denote full reasoning chain length and 
+$L_{\text{exit}}(\tau)$ denote the token position at which exit is triggered. 
+We define pruning ratio as:
+\[
+P(\tau) = 1 - \frac{L_{\text{exit}}(\tau)}{L_{\text{full}}}.
+\]
+Higher $P(\tau)$ indicates more aggressive pruning. We report this metric 
+for the fine-tuned Speculator to validate that different $\tau$ settings shift exit 
+decisions toward earlier points in the reasoning trace.
+
+\section{Team Member Contributions}
+\begin{itemize}
+\item \emph{svasani2}: Reasoner stack (QwQ-32B) for incremental, sentence-level reasoning traces and cumulative-prefix progression; Instructor stack (Phi-3-mini + LoRA) for mapping partial thoughts to structured tool calls (\texttt{\#TOOL[name]\{args\}}); project ideation, linear-layer SFT prototyping, and preliminary evaluation.
+\item \emph{apr11}: Data preparation for Speculator training---Modal-based scripts to materialize ToolBench-aligned traces and outputs, automated splitting of reasoning chains into cumulative sentence prefixes for supervision, and GPT-4.1~mini judge labeling of each prefix (READY vs.\ NOT\_READY) for the training dataset.
+\item \emph{cc215}: Surveyed Prior Work and researched Speculator training data.
+\item \emph{rmotati2}: Data collection, cleaning, and relabeling pipelines for Speculator fine tuning.
+\item \emph{vc50}: Literature review for related work, including comparative architecture analysis.
+\end{itemize}
+
+% \section{What is the timeline?}
+
+\clearpage
+\nocite{*}
+\bibliographystyle{unsrt}%Used BibTeX style is unsrt
+\bibliography{rlps}
+
+
+\end{document}

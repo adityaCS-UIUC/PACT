@@ -1,0 +1,10 @@
+.venv/
+.venv_smoke/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+data/
+logs/
+results/
+qwen_traces_*/

@@ -1,0 +1,11 @@
+openai-agents
+openai
+torch
+transformers
+peft
+datasets
+accelerate
+matplotlib
+numpy
+tqdm
+python-dotenv

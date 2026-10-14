@@ -1,0 +1,12 @@
+# Local training / eval.
+# - NumPy 2.x often breaks PyTorch wheels built against NumPy 1.x (_ARRAY_API / import errors).
+# - New transformers (4.46+/5.x) may require torch>=2.4; macOS x86_64 pip often only ships torch 2.2.x,
+#   so keep transformers < 4.46 for that combo, or install torch>=2.4 from conda/pytorch when available.
+numpy>=1.26,<2
+torch>=2.2.0
+transformers>=4.40.0,<4.46
+accelerate>=0.30.0
+sentencepiece
+safetensors
+tqdm>=4.66.0
+matplotlib>=3.8.0
