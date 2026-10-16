@@ -51,7 +51,3 @@ Set secrets in the environment, not in the repo:
 | `OPENAI_API_KEY` | GPT judge that labels prefixes READY or NOT_READY |
 | `HF_TOKEN` | Gated Hugging Face models such as Phi-3 |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | Modal GPU jobs |
-
-## Collaborators
-
-Course work with Smit Vasani and Ram. Published here from the local working copy.
